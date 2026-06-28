@@ -1,287 +1,139 @@
 from __future__ import annotations
 
-import json
-import pickle
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 
 import geopandas as gpd
-import networkx as nx
 import matplotlib.pyplot as plt
-from shapely.geometry import LineString, MultiLineString, Point
-from shapely.geometry.base import BaseGeometry
-from shapely.ops import unary_union
+import networkx as nx
+import numpy as np
+import osmnx as ox
+from scipy.spatial import cKDTree
+from shapely.geometry import Point
 
 
-DEFAULT_SHAPEFILE = Path(
-    r"data/Pedestrian Network Data - 4326/Pedestrian Network Data - 4326.shp"
-)
-
-DEFAULT_GRAPH_CACHE_DIR = Path(r"data/cache/pedestrian_graph")
-
-SOURCE_MATCH_TOLERANCE_M = 0.25
+DEFAULT_NETWORK_NAME = "toronto"
+DEFAULT_WALKING_PATHS_DIR = Path("data/walking-paths")
 
 
-def load_projected_pedestrian_network(
-    shapefile_path: str | Path,
-    target_crs: str | None = None,
-) -> gpd.GeoDataFrame:
-    """Load the pedestrian network and project it into a metric CRS.
-
-    The raw shapefile is stored in EPSG:4326. For graph construction, all
-    distances should be measured in meters, so we project the data before
-    building edges and heuristic-friendly node coordinates.
-    """
-
-    gdf = gpd.read_file(shapefile_path)
-    if gdf.empty:
-        raise ValueError(f"No features were read from {shapefile_path}")
-
-    if gdf.crs is None:
-        raise ValueError("The pedestrian network shapefile has no CRS defined")
-
-    if gdf.crs.is_projected:
-        projected = gdf.copy()
-    else:
-        metric_crs = target_crs or gdf.estimate_utm_crs()
-        projected = gdf.to_crs(metric_crs)
-
-    projected = projected.reset_index(drop=True).copy()
-    projected["source_feature_id"] = projected.index.astype(int)
-    return projected
+def _graphml_path(network_name: str, base_dir: str | Path = DEFAULT_WALKING_PATHS_DIR) -> Path:
+    return Path(base_dir) / f"{network_name}-walking-paths.graphml"
 
 
-def _iter_line_geometries(geometry: BaseGeometry) -> Iterable[LineString]:
-    if geometry.is_empty:
-        return
-
-    if isinstance(geometry, LineString):
-        yield geometry
-        return
-
-    if isinstance(geometry, MultiLineString):
-        for part in geometry.geoms:
-            yield from _iter_line_geometries(part)
-        return
-
-    geom_type = geometry.geom_type
-    if geom_type == "GeometryCollection":
-        for part in geometry.geoms:
-            yield from _iter_line_geometries(part)
+def _gpkg_path(network_name: str, base_dir: str | Path = DEFAULT_WALKING_PATHS_DIR) -> Path:
+    return Path(base_dir) / f"{network_name}-network.gpkg"
 
 
-def _point_key(point: Point, precision: int) -> tuple[float, float]:
-    return (round(float(point.x), precision), round(float(point.y), precision))
+def _canonical_node_id(graph: nx.Graph, node_id: object) -> object:
+    if node_id in graph:
+        return node_id
 
+    as_str = str(node_id)
+    if as_str in graph:
+        return as_str
 
-def _ensure_node(
-    graph: nx.MultiGraph,
-    node_lookup: dict[tuple[float, float], int],
-    point: Point,
-    precision: int,
-) -> int:
-    key = _point_key(point, precision)
-    node_id = node_lookup.get(key)
-    if node_id is None:
-        node_id = len(node_lookup)
-        node_lookup[key] = node_id
-        graph.add_node(
-            node_id,
-            x=float(point.x),
-            y=float(point.y),
-            geometry=Point(float(point.x), float(point.y)),
-            coordinate_key=key,
-        )
+    try:
+        as_int = int(node_id)
+    except (TypeError, ValueError):
+        as_int = None
+
+    if as_int is not None and as_int in graph:
+        return as_int
+
     return node_id
 
 
-def _source_feature_ids(
-    segment: LineString,
-    source_gdf: gpd.GeoDataFrame,
-) -> tuple[int, ...]:
-    midpoint = segment.interpolate(0.5, normalized=True)
-    search_area = midpoint.buffer(SOURCE_MATCH_TOLERANCE_M)
-    candidate_indexes = source_gdf.sindex.query(search_area, predicate="intersects")
-    matching_ids: list[int] = []
-
-    for candidate_index in candidate_indexes:
-        candidate_row = source_gdf.iloc[int(candidate_index)]
-        if candidate_row.geometry.distance(midpoint) <= SOURCE_MATCH_TOLERANCE_M:
-            matching_ids.append(int(candidate_row.source_feature_id))
-
-    return tuple(sorted(set(matching_ids)))
-
-
-def build_pedestrian_graph(
-    shapefile_path: str | Path = DEFAULT_SHAPEFILE,
-    target_crs: str | None = None,
-    node_precision: int = 3,
-) -> tuple[nx.MultiGraph, gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """Build a topology-aware pedestrian graph from the line shapefile.
-
-    The graph is intentionally a MultiGraph so parallel walkable segments are
-    preserved instead of being collapsed into a single edge.
-    """
-
-    network = load_projected_pedestrian_network(shapefile_path, target_crs=target_crs)
-
-    graph = nx.MultiGraph()
-    graph.graph["crs"] = network.crs
-    graph.graph["source_shapefile"] = str(shapefile_path)
-    graph.graph["node_precision"] = node_precision
-
-    node_lookup: dict[tuple[float, float], int] = {}
-    raw_linework = unary_union(network.geometry.to_list())
-
-    edge_rows: list[dict[str, object]] = []
-    for edge_id, segment in enumerate(_iter_line_geometries(raw_linework)):
-        if segment.is_empty or segment.length <= 0:
-            continue
-
-        coords = list(segment.coords)
-        if len(coords) < 2:
-            continue
-
-        start_point = Point(coords[0])
-        end_point = Point(coords[-1])
-        u = _ensure_node(graph, node_lookup, start_point, node_precision)
-        v = _ensure_node(graph, node_lookup, end_point, node_precision)
-
-        source_ids = _source_feature_ids(segment, network)
-        edge_data = {
-            "edge_id": edge_id,
-            "geometry": segment,
-            "length_m": float(segment.length),
-            "source_feature_ids": source_ids,
-        }
-        graph.add_edge(u, v, key=edge_id, **edge_data)
-
-        edge_rows.append(
-            {
-                "u": u,
-                "v": v,
-                "key": edge_id,
-                **edge_data,
-            }
-        )
-
-    node_rows = [
-        {
-            "node_id": node_id,
-            "x": data["x"],
-            "y": data["y"],
-            "geometry": data["geometry"],
-            "degree": graph.degree[node_id],
-            "coordinate_key": data["coordinate_key"],
-        }
-        for node_id, data in graph.nodes(data=True)
-    ]
-
-    nodes_gdf = gpd.GeoDataFrame(node_rows, geometry="geometry", crs=network.crs)
-    edges_gdf = gpd.GeoDataFrame(edge_rows, geometry="geometry", crs=network.crs)
-    return graph, nodes_gdf, edges_gdf, network
-
-
-def save_graph_bundle(
-    cache_dir: str | Path,
-    graph: nx.MultiGraph,
+def build_routing_index(
+    graph: nx.Graph,
     nodes_gdf: gpd.GeoDataFrame,
     edges_gdf: gpd.GeoDataFrame,
-    metadata: dict[str, object] | None = None,
-) -> Path:
-    """Persist a built graph bundle so it does not need to be rebuilt.
+) -> dict[str, Any]:
+    """Build one-time indexes to accelerate snapping and edge-geometry retrieval."""
 
-    The graph is saved with pickle, while the node and edge tables are stored as
-    GeoParquet for easier inspection and reuse.
-    """
+    node_id_column = "osmid" if "osmid" in nodes_gdf.columns else None
+    if node_id_column is None:
+        raise ValueError("nodes layer must contain an 'osmid' column")
 
-    cache_path = Path(cache_dir)
-    cache_path.mkdir(parents=True, exist_ok=True)
+    if "key" not in edges_gdf.columns:
+        raise ValueError("edges layer must contain a 'key' column")
 
-    with (cache_path / "graph.pkl").open("wb") as handle:
-        pickle.dump(graph, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    node_ids_raw = nodes_gdf[node_id_column].to_list()
+    canonical_node_ids = [_canonical_node_id(graph, raw_id) for raw_id in node_ids_raw]
 
-    nodes_gdf.to_parquet(cache_path / "nodes.parquet", index=False)
-    edges_gdf.to_parquet(cache_path / "edges.parquet", index=False)
+    x_values = nodes_gdf.geometry.x.to_numpy(dtype=float)
+    y_values = nodes_gdf.geometry.y.to_numpy(dtype=float)
+    points_array = np.column_stack((x_values, y_values))
 
-    payload = {
-        "crs": str(graph.graph.get("crs")) if graph.graph.get("crs") is not None else None,
-        "source_shapefile": graph.graph.get("source_shapefile"),
-        "node_precision": graph.graph.get("node_precision"),
+    if len(points_array) == 0:
+        raise ValueError("Cannot build routing index from an empty nodes layer")
+
+    node_tree = cKDTree(points_array)
+
+    edge_geom_by_uvk: dict[tuple[str, str, str], object] = {}
+    u_values = edges_gdf["u"].astype(str).to_numpy()
+    v_values = edges_gdf["v"].astype(str).to_numpy()
+    k_values = edges_gdf["key"].astype(str).to_numpy()
+    geom_values = edges_gdf.geometry.to_numpy()
+
+    for u, v, k, geom in zip(u_values, v_values, k_values, geom_values):
+        edge_geom_by_uvk[(u, v, k)] = geom
+        edge_geom_by_uvk[(v, u, k)] = geom
+
+    return {
+        "node_tree": node_tree,
+        "node_ids": canonical_node_ids,
+        "edge_geom_by_uvk": edge_geom_by_uvk,
     }
-    if metadata:
-        payload.update(metadata)
-
-    with (cache_path / "metadata.json").open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, default=str)
-
-    return cache_path
 
 
 def load_graph_bundle(
-    cache_dir: str | Path,
-) -> tuple[nx.MultiGraph, gpd.GeoDataFrame, gpd.GeoDataFrame, dict[str, object]]:
-    """Load a previously saved graph bundle."""
+    network_name: str = DEFAULT_NETWORK_NAME,
+    base_dir: str | Path = DEFAULT_WALKING_PATHS_DIR,
+) -> tuple[nx.MultiDiGraph, gpd.GeoDataFrame, gpd.GeoDataFrame, dict[str, object]]:
+    """Load graph topology from GraphML and geometries from GeoPackage."""
 
-    cache_path = Path(cache_dir)
-    with (cache_path / "graph.pkl").open("rb") as handle:
-        graph = pickle.load(handle)
+    graphml_path = _graphml_path(network_name, base_dir=base_dir)
+    gpkg_path = _gpkg_path(network_name, base_dir=base_dir)
 
-    nodes_gdf = gpd.read_parquet(cache_path / "nodes.parquet")
-    edges_gdf = gpd.read_parquet(cache_path / "edges.parquet")
+    if not graphml_path.exists():
+        raise FileNotFoundError(f"GraphML file not found: {graphml_path}")
+    if not gpkg_path.exists():
+        raise FileNotFoundError(f"GeoPackage file not found: {gpkg_path}")
 
-    metadata_path = cache_path / "metadata.json"
-    metadata: dict[str, object]
-    if metadata_path.exists():
-        with metadata_path.open("r", encoding="utf-8") as handle:
-            metadata = json.load(handle)
-    else:
-        metadata = {}
+    graph = ox.load_graphml(graphml_path)
+    nodes_gdf = gpd.read_file(gpkg_path, layer="nodes")
+    edges_gdf = gpd.read_file(gpkg_path, layer="edges")
 
+    if nodes_gdf.empty or edges_gdf.empty:
+        raise ValueError("GeoPackage layers are empty")
+    if nodes_gdf.crs is None or edges_gdf.crs is None:
+        raise ValueError("GeoPackage node/edge layers are missing CRS")
+
+    metadata = {
+        "network_name": network_name,
+        "graphml_path": str(graphml_path),
+        "gpkg_path": str(gpkg_path),
+        "crs": str(edges_gdf.crs),
+        "weight_field": "length_m" if "length_m" in edges_gdf.columns else "length",
+    }
     return graph, nodes_gdf, edges_gdf, metadata
 
 
-def load_or_build_graph_bundle(
-    cache_dir: str | Path = DEFAULT_GRAPH_CACHE_DIR,
-    shapefile_path: str | Path = DEFAULT_SHAPEFILE,
-    target_crs: str | None = None,
-    node_precision: int = 3,
-    force_rebuild: bool = False,
-) -> tuple[nx.MultiGraph, gpd.GeoDataFrame, gpd.GeoDataFrame, dict[str, object]]:
-    """Load a cached graph bundle when available, otherwise build and cache it."""
-
-    cache_path = Path(cache_dir)
-    if not force_rebuild and (cache_path / "graph.pkl").exists():
-        return load_graph_bundle(cache_path)
-
-    graph, nodes_gdf, edges_gdf, _network = build_pedestrian_graph(
-        shapefile_path=shapefile_path,
-        target_crs=target_crs,
-        node_precision=node_precision,
-    )
-    metadata = {
-        "shapefile_path": str(shapefile_path),
-        "target_crs": target_crs,
-    }
-    save_graph_bundle(cache_path, graph, nodes_gdf, edges_gdf, metadata=metadata)
-    return load_graph_bundle(cache_path)
-
-
-def nearest_node(
-    nodes_gdf: gpd.GeoDataFrame,
-    point: Point,
-) -> int:
-    """Return the closest graph node to a point.
-
-    This is a small helper for future routing steps when start and end points
-    are not exactly on a node.
-    """
-
+def nearest_node(graph: nx.Graph, nodes_gdf: gpd.GeoDataFrame, point: Point, routing_index: dict[str, Any] | None = None) -> object:
     if nodes_gdf.empty:
         raise ValueError("Cannot snap to a node in an empty graph")
 
+    if routing_index is not None:
+        _distance, index = routing_index["node_tree"].query([point.x, point.y], k=1)
+        return routing_index["node_ids"][int(index)]
+
+    node_id_column = "osmid" if "osmid" in nodes_gdf.columns else None
+    if node_id_column is None:
+        raise ValueError("nodes layer must contain an 'osmid' column")
+
     distances = nodes_gdf.geometry.distance(point)
-    return int(nodes_gdf.loc[distances.idxmin(), "node_id"])
+    nearest_id = nodes_gdf.loc[distances.idxmin(), node_id_column]
+    return _canonical_node_id(graph, nearest_id)
 
 
 def _coerce_point(
@@ -291,52 +143,116 @@ def _coerce_point(
 ) -> Point:
     if isinstance(coordinate, Point):
         point = coordinate
-        if input_crs == output_crs:
-            return point
     else:
         point = Point(float(coordinate[0]), float(coordinate[1]))
+
+    if input_crs == output_crs:
+        return point
 
     point_series = gpd.GeoSeries([point], crs=input_crs)
     return point_series.to_crs(output_crs).iloc[0]
 
 
+def _edge_geometry_from_edges_table(
+    edges_gdf: gpd.GeoDataFrame,
+    u: object,
+    v: object,
+    key: object,
+    routing_index: dict[str, Any] | None = None,
+):
+    if routing_index is not None:
+        return routing_index["edge_geom_by_uvk"].get((str(u), str(v), str(key)))
+
+    key_col = "key" if "key" in edges_gdf.columns else None
+    if key_col is None:
+        return None
+
+    key_str = str(key)
+    u_str = str(u)
+    v_str = str(v)
+
+    direct = edges_gdf[
+        (edges_gdf["u"].astype(str) == u_str)
+        & (edges_gdf["v"].astype(str) == v_str)
+        & (edges_gdf[key_col].astype(str) == key_str)
+    ]
+    if not direct.empty:
+        return direct.geometry.iloc[0]
+
+    reverse = edges_gdf[
+        (edges_gdf["u"].astype(str) == v_str)
+        & (edges_gdf["v"].astype(str) == u_str)
+        & (edges_gdf[key_col].astype(str) == key_str)
+    ]
+    if not reverse.empty:
+        return reverse.geometry.iloc[0]
+
+    return None
+
+
 def _edge_for_node_pair(
-    graph: nx.MultiGraph,
-    u: int,
-    v: int,
-) -> tuple[int, dict[str, object]]:
+    graph: nx.Graph,
+    edges_gdf: gpd.GeoDataFrame,
+    u: object,
+    v: object,
+    weight_field: str,
+    routing_index: dict[str, Any] | None = None,
+) -> tuple[object, dict[str, object], object]:
     edge_data = graph.get_edge_data(u, v)
     if not edge_data:
         raise ValueError(f"No edge exists between nodes {u} and {v}")
 
-    key, attrs = min(edge_data.items(), key=lambda item: float(item[1].get("length_m", float("inf"))))
-    return int(key), attrs
+    key, attrs = min(
+        edge_data.items(),
+        key=lambda item: float(item[1].get(weight_field, item[1].get("length", float("inf")))),
+    )
+    geom = _edge_geometry_from_edges_table(edges_gdf, u=u, v=v, key=key, routing_index=routing_index)
+    return key, attrs, geom
 
 
 def compute_shortest_route(
-    graph: nx.MultiGraph,
+    graph: nx.Graph,
     nodes_gdf: gpd.GeoDataFrame,
+    edges_gdf: gpd.GeoDataFrame,
     start_coord: tuple[float, float] | list[float] | Point,
     end_coord: tuple[float, float] | list[float] | Point,
     input_crs: str = "EPSG:4326",
+    weight_field: str = "length",
+    routing_index: dict[str, Any] | None = None,
 ) -> dict[str, object]:
-    """Compute a length-based route between two coordinates."""
+    """Compute an edge-length shortest path route between two coordinates."""
 
-    graph_crs = str(graph.graph.get("crs"))
-    start_point = _coerce_point(start_coord, input_crs=input_crs, output_crs=graph_crs)
-    end_point = _coerce_point(end_coord, input_crs=input_crs, output_crs=graph_crs)
+    network_crs = str(edges_gdf.crs)
+    start_point = _coerce_point(start_coord, input_crs=input_crs, output_crs=network_crs)
+    end_point = _coerce_point(end_coord, input_crs=input_crs, output_crs=network_crs)
 
-    start_node = nearest_node(nodes_gdf, start_point)
-    end_node = nearest_node(nodes_gdf, end_point)
+    start_node = nearest_node(graph, nodes_gdf, start_point, routing_index=routing_index)
+    end_node = nearest_node(graph, nodes_gdf, end_point, routing_index=routing_index)
 
-    route_nodes = nx.shortest_path(graph, start_node, end_node, weight="length_m")
+    route_nodes = nx.shortest_path(graph, start_node, end_node, weight=weight_field)
     route_edges: list[dict[str, object]] = []
     route_length_m = 0.0
 
     for u, v in zip(route_nodes[:-1], route_nodes[1:]):
-        key, attrs = _edge_for_node_pair(graph, u, v)
-        route_edges.append({"u": u, "v": v, "key": key, **attrs})
-        route_length_m += float(attrs["length_m"])
+        key, attrs, edge_geom = _edge_for_node_pair(
+            graph,
+            edges_gdf=edges_gdf,
+            u=u,
+            v=v,
+            weight_field=weight_field,
+            routing_index=routing_index,
+        )
+        segment_length = float(attrs.get(weight_field, attrs.get("length", 0.0)))
+        route_length_m += segment_length
+        route_edges.append(
+            {
+                "u": u,
+                "v": v,
+                "key": key,
+                "length_m": segment_length,
+                "geometry": edge_geom,
+            }
+        )
 
     return {
         "start_node": start_node,
@@ -350,22 +266,27 @@ def compute_shortest_route(
 
 
 def plot_route_between_coordinates(
-    graph: nx.MultiGraph,
+    graph: nx.Graph,
     nodes_gdf: gpd.GeoDataFrame,
     edges_gdf: gpd.GeoDataFrame,
     start_coord: tuple[float, float] | list[float] | Point,
     end_coord: tuple[float, float] | list[float] | Point,
     input_crs: str = "EPSG:4326",
+    weight_field: str = "length",
+    routing_index: dict[str, Any] | None = None,
+    full_network: bool = False,
+    route_buffer_m: float = 150.0,
     ax: plt.Axes | None = None,
 ) -> tuple[plt.Figure, plt.Axes, dict[str, object]]:
-    """Plot the network and a computed route between two coordinate inputs."""
-
     route = compute_shortest_route(
         graph=graph,
         nodes_gdf=nodes_gdf,
+        edges_gdf=edges_gdf,
         start_coord=start_coord,
         end_coord=end_coord,
         input_crs=input_crs,
+        weight_field=weight_field,
+        routing_index=routing_index,
     )
 
     if ax is None:
@@ -373,11 +294,28 @@ def plot_route_between_coordinates(
     else:
         fig = ax.figure
 
-    edges_gdf.plot(ax=ax, color="#c8c8c8", linewidth=0.35, alpha=0.45, zorder=1)
+    route_geometries = [edge["geometry"] for edge in route["route_edges"] if edge["geometry"] is not None]
+    if route_geometries:
+        route_series = gpd.GeoSeries(route_geometries, crs=edges_gdf.crs)
+    else:
+        route_series = gpd.GeoSeries([], crs=edges_gdf.crs)
 
-    route_edge_geoms = [edge["geometry"] for edge in route["route_edges"]]
-    route_edges_gdf = gpd.GeoSeries(route_edge_geoms, crs=edges_gdf.crs)
-    route_edges_gdf.plot(ax=ax, color="#d7301f", linewidth=2.5, alpha=0.95, zorder=3)
+    if full_network or route_series.empty:
+        edges_to_plot = edges_gdf
+    else:
+        route_area = route_series.unary_union.buffer(route_buffer_m)
+        edges_to_plot = edges_gdf[edges_gdf.geometry.intersects(route_area)]
+
+    edges_to_plot.plot(ax=ax, color="#bcbcbc", linewidth=0.4, alpha=0.5, zorder=1)
+
+    if not route_series.empty:
+        route_series.plot(
+            ax=ax,
+            color="#d7301f",
+            linewidth=2.5,
+            alpha=0.95,
+            zorder=3,
+        )
 
     start_geom = route["start_point"]
     end_geom = route["end_point"]
@@ -388,83 +326,36 @@ def plot_route_between_coordinates(
     ax.set_axis_off()
     ax.legend(loc="upper right")
     ax.set_title(f"Shortest route by length: {route['route_length_m']:.1f} m")
-
     return fig, ax, route
 
 
-def plot_route_on_original_shapefile(
-    graph: nx.MultiGraph,
-    nodes_gdf: gpd.GeoDataFrame,
-    edges_gdf: gpd.GeoDataFrame,
-    original_shapefile_path: str | Path,
-    start_coord: tuple[float, float] | list[float] | Point,
-    end_coord: tuple[float, float] | list[float] | Point,
-    input_crs: str = "EPSG:4326",
-    ax: plt.Axes | None = None,
-) -> tuple[plt.Figure, plt.Axes, dict[str, object]]:
-    """Plot a computed route on top of the original shapefile coordinates."""
-
-    original_network = gpd.read_file(original_shapefile_path)
-    if original_network.crs is None:
-        raise ValueError("The original shapefile has no CRS defined")
-
-    route = compute_shortest_route(
-        graph=graph,
-        nodes_gdf=nodes_gdf,
-        start_coord=start_coord,
-        end_coord=end_coord,
-        input_crs=input_crs,
-    )
-
-    route_geom = gpd.GeoSeries([edge["geometry"] for edge in route["route_edges"]], crs=graph.graph["crs"])
-    route_geom = route_geom.to_crs(original_network.crs)
-
-    start_point = gpd.GeoSeries([route["start_point"]], crs=graph.graph["crs"]).to_crs(original_network.crs).iloc[0]
-    end_point = gpd.GeoSeries([route["end_point"]], crs=graph.graph["crs"]).to_crs(original_network.crs).iloc[0]
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(12, 12))
-    else:
-        fig = ax.figure
-
-    original_network.plot(ax=ax, color="#8f8f8f", linewidth=0.6, alpha=0.6, zorder=1)
-    route_geom.plot(ax=ax, color="#d7301f", linewidth=2.8, alpha=0.95, zorder=3)
-
-    ax.scatter([start_point.x], [start_point.y], s=60, c="#1a9850", edgecolors="black", linewidths=0.6, zorder=4, label="start")
-    ax.scatter([end_point.x], [end_point.y], s=60, c="#2b83ba", edgecolors="black", linewidths=0.6, zorder=4, label="end")
-
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_axis_off()
-    ax.legend(loc="upper right")
-    ax.set_title(f"Route on original shapefile: {route['route_length_m']:.1f} m")
-
-    return fig, ax, route
-
-
-def summarize_graph(graph: nx.MultiGraph) -> str:
+def summarize_graph(graph: nx.Graph) -> str:
     return f"nodes={graph.number_of_nodes()}, edges={graph.number_of_edges()}, crs={graph.graph.get('crs')}"
 
 
 if __name__ == "__main__":
-    graph, nodes_gdf, edges_gdf, metadata = load_or_build_graph_bundle()
+    graph, nodes_gdf, edges_gdf, metadata = load_graph_bundle(network_name=DEFAULT_NETWORK_NAME)
+    routing_index = build_routing_index(graph=graph, nodes_gdf=nodes_gdf, edges_gdf=edges_gdf)
     print(summarize_graph(graph))
     print(f"nodes table rows={len(nodes_gdf)}")
     print(f"edges table rows={len(edges_gdf)}")
-    print(f"cache metadata keys={sorted(metadata.keys())}")
+    print(f"dataset={metadata['network_name']}")
+    print(f"weight field={metadata['weight_field']}")
 
-    start_coord = (43.642017, -79.385882)
-    end_coord = (43.644417, -79.388826)
-    start_lonlat = (start_coord[1], start_coord[0])
-    end_lonlat = (end_coord[1], end_coord[0])
+    start_coord = (-79.385882, 43.642017)
+    end_coord = (-79.388826, 43.644417)
 
-    fig, ax, route = plot_route_on_original_shapefile(
+    fig, ax, route = plot_route_between_coordinates(
         graph=graph,
         nodes_gdf=nodes_gdf,
         edges_gdf=edges_gdf,
-        original_shapefile_path=DEFAULT_SHAPEFILE,
-        start_coord=start_lonlat,
-        end_coord=end_lonlat,
+        start_coord=start_coord,
+        end_coord=end_coord,
         input_crs="EPSG:4326",
+        weight_field=str(metadata["weight_field"]),
+        routing_index=routing_index,
+        full_network=False,
+        route_buffer_m=150.0,
     )
     print(f"route nodes={len(route['route_nodes'])}")
     print(f"route length m={route['route_length_m']:.1f}")
