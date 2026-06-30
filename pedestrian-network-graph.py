@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import time
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 import networkx as nx
 import numpy as np
 import osmnx as ox
@@ -83,6 +85,7 @@ def build_routing_index(
         "node_tree": node_tree,
         "node_ids": canonical_node_ids,
         "edge_geom_by_uvk": edge_geom_by_uvk,
+        "edge_sindex": edges_gdf.sindex,
     }
 
 
@@ -162,31 +165,6 @@ def _edge_geometry_from_edges_table(
 ):
     if routing_index is not None:
         return routing_index["edge_geom_by_uvk"].get((str(u), str(v), str(key)))
-
-    key_col = "key" if "key" in edges_gdf.columns else None
-    if key_col is None:
-        return None
-
-    key_str = str(key)
-    u_str = str(u)
-    v_str = str(v)
-
-    direct = edges_gdf[
-        (edges_gdf["u"].astype(str) == u_str)
-        & (edges_gdf["v"].astype(str) == v_str)
-        & (edges_gdf[key_col].astype(str) == key_str)
-    ]
-    if not direct.empty:
-        return direct.geometry.iloc[0]
-
-    reverse = edges_gdf[
-        (edges_gdf["u"].astype(str) == v_str)
-        & (edges_gdf["v"].astype(str) == u_str)
-        & (edges_gdf[key_col].astype(str) == key_str)
-    ]
-    if not reverse.empty:
-        return reverse.geometry.iloc[0]
-
     return None
 
 
@@ -210,6 +188,18 @@ def _edge_for_node_pair(
     return key, attrs, geom
 
 
+def _astar_heuristic(graph: nx.Graph, target_node: object):
+    tx = graph.nodes[target_node]["x"]
+    ty = graph.nodes[target_node]["y"]
+
+    def heuristic(node: object, _: object) -> float:
+        nx_ = graph.nodes[node]["x"]
+        ny_ = graph.nodes[node]["y"]
+        return float(np.hypot(nx_ - tx, ny_ - ty))
+
+    return heuristic
+
+
 def compute_shortest_route(
     graph: nx.Graph,
     nodes_gdf: gpd.GeoDataFrame,
@@ -229,7 +219,14 @@ def compute_shortest_route(
     start_node = nearest_node(graph, nodes_gdf, start_point, routing_index=routing_index)
     end_node = nearest_node(graph, nodes_gdf, end_point, routing_index=routing_index)
 
-    route_nodes = nx.shortest_path(graph, start_node, end_node, weight=weight_field)
+    route_nodes = nx.astar_path(
+        graph,
+        start_node,
+        end_node,
+        heuristic=_astar_heuristic(graph, end_node),
+        weight=weight_field,
+    )
+
     route_edges: list[dict[str, object]] = []
     route_length_m = 0.0
 
@@ -278,6 +275,9 @@ def plot_route_between_coordinates(
     route_buffer_m: float = 150.0,
     ax: plt.Axes | None = None,
 ) -> tuple[plt.Figure, plt.Axes, dict[str, object]]:
+    
+    t0 = time.perf_counter()
+
     route = compute_shortest_route(
         graph=graph,
         nodes_gdf=nodes_gdf,
@@ -289,39 +289,44 @@ def plot_route_between_coordinates(
         routing_index=routing_index,
     )
 
+    t1 = time.perf_counter()
+    print("== routing:", t1 - t0)
+
     if ax is None:
         fig, ax = plt.subplots(figsize=(12, 12))
     else:
         fig = ax.figure
 
     route_geometries = [edge["geometry"] for edge in route["route_edges"] if edge["geometry"] is not None]
-    if route_geometries:
-        route_series = gpd.GeoSeries(route_geometries, crs=edges_gdf.crs)
-    else:
-        route_series = gpd.GeoSeries([], crs=edges_gdf.crs)
 
-    if full_network or route_series.empty:
+    if full_network or not route_geometries:
         edges_to_plot = edges_gdf
     else:
-        route_area = route_series.unary_union.buffer(route_buffer_m)
-        edges_to_plot = edges_gdf[edges_gdf.geometry.intersects(route_area)]
+        route_area = gpd.GeoSeries(route_geometries, crs=edges_gdf.crs).union_all().buffer(route_buffer_m)
+        candidate_idx = list(routing_index["edge_sindex"].query(route_area))
+        edges_to_plot = edges_gdf.iloc[candidate_idx]
+        edges_to_plot = edges_to_plot[edges_to_plot.geometry.intersects(route_area)]
 
-    edges_to_plot.plot(ax=ax, color="#bcbcbc", linewidth=0.4, alpha=0.5, zorder=1)
+    background_segments = [
+        np.asarray(geom.coords)
+        for geom in edges_to_plot.geometry
+        if geom is not None and hasattr(geom, "coords")
+    ]
+    ax.add_collection(LineCollection(background_segments, linewidths=0.4, alpha=0.5))
 
-    if not route_series.empty:
-        route_series.plot(
-            ax=ax,
-            color="#d7301f",
-            linewidth=2.5,
-            alpha=0.95,
-            zorder=3,
-        )
+    route_segments = [
+        np.asarray(geom.coords)
+        for geom in route_geometries
+        if geom is not None and hasattr(geom, "coords")
+    ]
+    ax.add_collection(LineCollection(route_segments, linewidths=2.5))
 
     start_geom = route["start_point"]
     end_geom = route["end_point"]
-    ax.scatter([start_geom.x], [start_geom.y], s=55, c="#1a9850", edgecolors="black", linewidths=0.6, zorder=4, label="start")
-    ax.scatter([end_geom.x], [end_geom.y], s=55, c="#2b83ba", edgecolors="black", linewidths=0.6, zorder=4, label="end")
+    ax.scatter([start_geom.x], [start_geom.y], s=55, zorder=4, label="start")
+    ax.scatter([end_geom.x], [end_geom.y], s=55, zorder=4, label="end")
 
+    ax.autoscale()
     ax.set_aspect("equal", adjustable="box")
     ax.set_axis_off()
     ax.legend(loc="upper right")
@@ -334,6 +339,9 @@ def summarize_graph(graph: nx.Graph) -> str:
 
 
 if __name__ == "__main__":
+
+    t0 = time.perf_counter()
+
     graph, nodes_gdf, edges_gdf, metadata = load_graph_bundle(network_name=DEFAULT_NETWORK_NAME)
     routing_index = build_routing_index(graph=graph, nodes_gdf=nodes_gdf, edges_gdf=edges_gdf)
     print(summarize_graph(graph))
@@ -341,6 +349,9 @@ if __name__ == "__main__":
     print(f"edges table rows={len(edges_gdf)}")
     print(f"dataset={metadata['network_name']}")
     print(f"weight field={metadata['weight_field']}")
+
+    t1 = time.perf_counter()
+    print("== load graph bundle:", t1 - t0)
 
     start_coord = (-79.385882, 43.642017)
     end_coord = (-79.388826, 43.644417)
