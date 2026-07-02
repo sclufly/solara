@@ -1,6 +1,8 @@
+import time
 import pickle
 from pathlib import Path
 from typing import Any, Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -9,8 +11,10 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import pybdshadow
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, mapping
 from shapely import make_valid
+from rasterio.transform import from_bounds
+from rasterio.features import rasterize as rio_rasterize
 
 
 DEFAULT_NETWORK_NAME = "toronto"
@@ -136,7 +140,7 @@ def _best_edge_choice(
     if best_key is None or best_attrs is None:
         raise ValueError("No usable edge exists between the requested nodes")
 
-    return best_key, best_attrs, best_geom, float(best_attrs.get(weight_field, best_attrs.get("length", 0.0))), best_cost
+    return best_key, best_attrs, best_geom, float(best_attrs.get("length", best_attrs.get(weight_field, 0.0))), best_cost
 
 
 def _build_route_corridor(
@@ -374,6 +378,108 @@ def _clean_geometry(geometry: object) -> object:
     except Exception:
         return geometry.buffer(0)
 
+def _rasterize_shadow_union(
+    shadow_union,
+    crs: str,
+    resolution_m: float = 1.0,
+) -> tuple[np.ndarray, object]:
+    """Burn shadow polygons into a boolean raster. Returns (grid, transform)."""
+
+    minx, miny, maxx, maxy = shadow_union.bounds
+    width  = max(1, int((maxx - minx) / resolution_m))
+    height = max(1, int((maxy - miny) / resolution_m))
+
+    transform = from_bounds(minx, miny, maxx, maxy, width, height)
+    grid = rio_rasterize(
+        [(mapping(shadow_union), 1)],
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        dtype=np.uint8,
+    )
+    return grid, transform
+
+
+def _shadow_fraction_from_raster(
+    edge_geom,
+    grid: np.ndarray,
+    transform,
+    n_samples: int = 20,
+) -> float:
+    """Sample edge geometry against raster; return fraction in shadow."""
+    if edge_geom is None or edge_geom.is_empty:
+        return 0.0
+
+    coords = [
+        edge_geom.interpolate(t, normalized=True)
+        for t in np.linspace(0, 1, n_samples)
+    ]
+    # Convert world coords → pixel coords
+    xs = np.array([p.x for p in coords])
+    ys = np.array([p.y for p in coords])
+
+    # rasterio transform: col = (x - left) / res_x, row = (top - y) / res_y
+    res_x = transform.a
+    res_y = -transform.e
+    cols = ((xs - transform.c) / res_x).astype(int)
+    rows = ((transform.f - ys) / res_y).astype(int)
+
+    h, w = grid.shape
+    valid = (cols >= 0) & (cols < w) & (rows >= 0) & (rows < h)
+    if not valid.any():
+        return 0.0
+
+    return float(grid[rows[valid], cols[valid]].mean())
+
+def _narrow_corridor_subgraph(
+    graph: nx.Graph,
+    edges_gdf: gpd.GeoDataFrame,
+    routing_index: dict,
+    fastest_route: dict,
+    narrow_buffer_m: float = 100.0,
+) -> tuple[nx.MultiDiGraph, dict]:
+    """Build a subgraph restricted to a narrow corridor around the fastest route."""
+    route_geometries = [
+        e["geometry"] for e in fastest_route["route_edges"]
+        if e.get("geometry") is not None
+    ]
+    if not route_geometries:
+        return graph.copy(), {}
+
+    route_line = gpd.GeoSeries(route_geometries, crs=edges_gdf.crs).union_all()
+    corridor = route_line.buffer(narrow_buffer_m)
+
+    candidate_idx = list(routing_index["edge_sindex"].query(corridor))
+    candidate_edges = edges_gdf.iloc[candidate_idx]
+
+    route_edges = []
+    edge_lookup = {}
+    for row in candidate_edges.itertuples():
+        u = _canonical_node_id(graph, row.u)
+        v = _canonical_node_id(graph, row.v)
+        key = row.key
+        route_edges.append((u, v, key))
+        edge_lookup[(u, v, key)] = row.geometry
+        edge_lookup[(v, u, key)] = row.geometry
+
+    if not route_edges:
+        return graph.copy(), {}
+
+    return graph.edge_subgraph(route_edges).copy(), edge_lookup
+
+def _annotate_edges_with_shadow(
+    route_graph: nx.MultiDiGraph,
+    edge_lookup: dict,
+    grid: np.ndarray,
+    transform,
+    weight_field: str,
+    shade_weight: float,
+) -> None:
+    for u, v, key, attrs in route_graph.edges(keys=True, data=True):
+        geom = edge_lookup.get((u, v, key)) or edge_lookup.get((v, u, key))
+        frac = _shadow_fraction_from_raster(geom, grid, transform) if geom else 0.0
+        base = float(attrs.get(weight_field, attrs.get("length", 0.0)))
+        attrs["shaded_cost"] = base * (1.0 + shade_weight * (1.0 - frac))
 
 def _route_shadow_fraction(route: dict[str, object], shadow_union: object | None) -> float:
     if shadow_union is None or route.get("route_length_m", 0.0) <= 0:
@@ -389,31 +495,30 @@ def _route_shadow_fraction(route: dict[str, object], shadow_union: object | None
     return float(100.0 * shadow_length_m / route["route_length_m"])
 
 
-def _shadow_penalty_fn(shadow_union: object | None, weight_field: str, shade_weight: float) -> ShadowPenaltyFn | None:
-    if shadow_union is None:
-        return None
-
-    def penalty(edge_geom: object, attrs: dict[str, object]) -> float:
-        if edge_geom is None or getattr(edge_geom, "is_empty", True):
-            return 0.0
-
+def _shadow_penalty_fn_raster(
+    grid: np.ndarray,
+    transform,
+    weight_field: str,
+    shade_weight: float,
+) -> ShadowPenaltyFn:
+    def penalty(edge_geom, attrs: dict) -> float:
         base_cost = float(attrs.get(weight_field, attrs.get("length", 0.0)))
         if base_cost <= 0:
             return 0.0
-
-        shadow_length_m = edge_geom.intersection(shadow_union).length
-        shade_fraction = min(1.0, max(0.0, shadow_length_m / edge_geom.length)) if edge_geom.length else 0.0
-        return base_cost * shade_weight * (1.0 - shade_fraction)
-
+        shade_frac = _shadow_fraction_from_raster(edge_geom, grid, transform)
+        return base_cost * shade_weight * shade_frac
     return penalty
 
+def _compute_shadows_chunk(args):
+    buildings_chunk, shadow_time = args
+    return pybdshadow.bdshadow_sunlight(buildings_chunk, shadow_time, roof=False, include_building=False)
 
 def _load_local_buildings_for_route(
     buildings_path: str | Path,
     corridor: LineString,
     route_crs: str,
     shadow_time: pd.Timestamp,
-    read_buffer_m: float = 600.0,
+    read_buffer_m: float = 200.0,
     source_crs: str = "EPSG:4326",
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     search_area = corridor.buffer(read_buffer_m)
@@ -441,10 +546,22 @@ def _load_local_buildings_for_route(
         return buildings, buildings
 
     buildings = pybdshadow.bd_preprocess(buildings, height="height")
-    shadows = pybdshadow.bdshadow_sunlight(buildings, shadow_time, roof=False, include_building=False)
+
+    n_workers = 8
+    chunks = np.array_split(buildings, n_workers)
+    chunks = [c for c in chunks if not c.empty]
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        shadow_parts = list(executor.map(_compute_shadows_chunk, [(c, shadow_time) for c in chunks]))
+
+    shadows = pd.concat(shadow_parts, ignore_index=True)
+    shadows = gpd.GeoDataFrame(shadows, crs=buildings.crs)
+
     buildings = buildings.to_crs(route_crs)
     shadows = shadows.to_crs(route_crs)
-    shadows["geometry"] = shadows.geometry.apply(_clean_geometry)
+    invalid_mask = ~shadows.geometry.is_valid
+    if invalid_mask.any():
+        shadows.loc[invalid_mask, "geometry"] = shadows.loc[invalid_mask, "geometry"].apply(_clean_geometry)
     return buildings, shadows
 
 
@@ -458,10 +575,13 @@ def compute_shadow_aware_route_report(
     buildings_path: str | Path = DEFAULT_BUILDINGS_PATH,
     input_crs: str = "EPSG:4326",
     route_buffer_m: float = 250.0,
-    shadow_read_buffer_m: float = 600.0,
+    shadow_read_buffer_m: float = 200.0,
     shade_weight: float = 0.75,
     routing_index: dict[str, Any] | None = None,
 ) -> dict[str, object]:
+
+    t0 = time.perf_counter()   
+
     network_crs = str(edges_gdf.crs)
     start_point = _coerce_point(start_coord, input_crs=input_crs, output_crs=network_crs)
     end_point = _coerce_point(end_coord, input_crs=input_crs, output_crs=network_crs)
@@ -475,9 +595,21 @@ def compute_shadow_aware_route_report(
         read_buffer_m=shadow_read_buffer_m,
     )
 
-    shadow_union = None if shadows_gdf.empty else gpd.GeoSeries(shadows_gdf.geometry.apply(_clean_geometry), crs=shadows_gdf.crs).union_all()
-    penalty_fn = _shadow_penalty_fn(shadow_union, weight_field="length", shade_weight=shade_weight)
+    print(f"buildings+shadows: {time.perf_counter()-t0:.2f}s")
+    t1 = time.perf_counter()
 
+    # Build shadow union (None if no shadows)
+    shadow_union = None
+    if not shadows_gdf.empty:
+        simplified = shadows_gdf.geometry.apply(
+            lambda g: g.simplify(2.0, preserve_topology=False)
+        )
+        shadow_union = gpd.GeoSeries(simplified, crs=shadows_gdf.crs).buffer(0).union_all()
+    
+    print(f"union+simplify: {time.perf_counter()-t1:.2f}s")
+    t2 = time.perf_counter()
+
+    # Fastest route (pure distance, no shadow awareness)
     fastest_route = compute_shortest_route(
         graph=graph,
         nodes_gdf=nodes_gdf,
@@ -490,18 +622,51 @@ def compute_shadow_aware_route_report(
         route_buffer_m=route_buffer_m,
     )
 
-    shaded_route = compute_shortest_route(
-        graph=graph,
-        nodes_gdf=nodes_gdf,
-        edges_gdf=edges_gdf,
-        start_coord=start_coord,
-        end_coord=end_coord,
-        input_crs=input_crs,
-        weight_field="length",
-        routing_index=routing_index,
-        route_buffer_m=route_buffer_m,
-        shadow_penalty_fn=penalty_fn,
-    )
+    print(f"fastest route: {time.perf_counter()-t2:.2f}s")
+    t3 = time.perf_counter()
+
+    # Shaded route
+    if shadow_union is not None:
+        # Rasterize once
+        grid, transform = _rasterize_shadow_union(shadow_union, crs=network_crs, resolution_m=1.0)
+
+        print(f"rasterize: {time.perf_counter()-t3:.2f}s")
+        t4 = time.perf_counter()
+
+        # Build narrow corridor subgraph around fastest route
+        route_graph, edge_lookup = _narrow_corridor_subgraph(
+            graph=graph,
+            edges_gdf=edges_gdf,
+            routing_index=routing_index,
+            fastest_route=fastest_route,
+            narrow_buffer_m=100.0,
+        )
+
+        # Pre-cache shaded_cost on every edge — no geometry work during A*
+        _annotate_edges_with_shadow(
+            route_graph, edge_lookup, grid, transform,
+            weight_field="length", shade_weight=shade_weight,
+        )
+
+        print(f"annotate edges: {time.perf_counter()-t4:.2f}s")
+        t5 = time.perf_counter()
+
+        # A* on pre-annotated subgraph: pure float lookups, no penalty_fn
+        shaded_route = compute_shortest_route(
+            graph=route_graph,          # pre-annotated subgraph, not full graph
+            nodes_gdf=nodes_gdf,
+            edges_gdf=edges_gdf,
+            start_coord=start_coord,
+            end_coord=end_coord,
+            input_crs=input_crs,
+            weight_field="shaded_cost", # key: route on cached costs
+            routing_index=routing_index,
+            route_buffer_m=route_buffer_m,
+            shadow_penalty_fn=None,     # key: no per-evaluation geometry work
+        )
+        print(f"shaded route: {time.perf_counter()-t5:.2f}s")
+    else:
+        shaded_route = fastest_route
 
     return {
         "shadow_time": shadow_time,

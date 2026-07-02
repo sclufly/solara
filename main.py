@@ -3,14 +3,13 @@ import time
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from pedestrian_network_graph import (
+from routing import (
     DEFAULT_BUILDINGS_PATH,
     DEFAULT_NETWORK_NAME,
     TorontoRoutingEngine,
     compute_shadow_aware_route_report,
     plot_shadow_route_report,
 )
-
 
 def main() -> None:
     t0 = time.perf_counter()
