@@ -26,8 +26,12 @@ def main() -> None:
     t1 = time.perf_counter()
     print("=> load graph bundle:", t1 - t0)
 
+    # cn tower
     start_coord = (-79.385882, 43.642017)
-    end_coord = (-79.388826, 43.644417)
+    # eaton center
+    end_coord = (-79.379964, 43.652288)
+    # cbc building 
+    #end_coord = (-79.388826, 43.644417)
 
     report = compute_shadow_aware_route_report(
         graph=engine.graph,
@@ -46,17 +50,30 @@ def main() -> None:
 
     t2 = time.perf_counter()
     print("=> routing + shadows:", t2 - t1)
-    print(f"shadow time={shadow_time.isoformat()}")
-    print("fastest route = baseline shortest path")
-    print(f"fastest route nodes={len(report['fastest_route']['route_nodes'])}")
-    print(f"fastest route length m={report['fastest_route']['route_length_m']:.1f}")
-    print(f"fastest route shade cover %={report['fastest_shade_pct']:.1f}")
-    print("shade-aware route = shortest path biased toward shadow")
-    print(f"shade-aware route nodes={len(report['shaded_route']['route_nodes'])}")
-    print(f"shade-aware route length m={report['shaded_route']['route_length_m']:.1f}")
-    print(f"shade-aware route shade cover %={report['shaded_shade_pct']:.1f}")
 
     fig, ax = plot_shadow_route_report(report)
+
+    stats = [
+        f"Shadow time: {shadow_time.strftime('%Y-%m-%d %H:%M %Z')}",
+        "",
+        f"Fastest route: {report['fastest_route']['route_length_m']:.1f} m  |  "
+        f"{len(report['fastest_route']['route_nodes'])} nodes  |  "
+        f"{report['fastest_shade_pct']:.1f}% shade",
+        "",
+        f"Shade-aware route: {report['shaded_route']['route_length_m']:.1f} m  |  "
+        f"{len(report['shaded_route']['route_nodes'])} nodes  |  "
+        f"{report['shaded_shade_pct']:.1f}% shade",
+    ]
+
+    ax.text(
+        0.01, 0.01,
+        "\n".join(stats),
+        transform=ax.transAxes,
+        fontsize=9,
+        verticalalignment="bottom",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.8, edgecolor="none"),
+    )
+
     plt.show()
 
 
