@@ -7,11 +7,15 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 import networkx as nx
 import numpy as np
+import pandas as pd
+import pybdshadow
 from shapely.geometry import LineString, Point
+from shapely import make_valid
 
 
 DEFAULT_NETWORK_NAME = "toronto"
 DEFAULT_WALKING_PATHS_DIR = Path("data/walking-paths")
+DEFAULT_BUILDINGS_PATH = Path("data/buildings/buildings.gpkg")
 ShadowPenaltyFn = Callable[[object, dict[str, object]], float]
 
 
@@ -355,6 +359,195 @@ class TorontoRoutingEngine:
             *args,
             **kwargs,
         )
+
+
+def _projected_route_corridor(start_point: Point, end_point: Point, buffer_m: float) -> LineString:
+    return LineString([start_point, end_point]).buffer(buffer_m)
+
+
+def _clean_geometry(geometry: object) -> object:
+    if geometry is None or getattr(geometry, "is_empty", True):
+        return geometry
+
+    try:
+        return geometry if geometry.is_valid else make_valid(geometry)
+    except Exception:
+        return geometry.buffer(0)
+
+
+def _route_shadow_fraction(route: dict[str, object], shadow_union: object | None) -> float:
+    if shadow_union is None or route.get("route_length_m", 0.0) <= 0:
+        return 0.0
+
+    shadow_length_m = 0.0
+    for edge in route["route_edges"]:
+        geom = edge.get("geometry")
+        if geom is None or geom.is_empty:
+            continue
+        shadow_length_m += geom.intersection(shadow_union).length
+
+    return float(100.0 * shadow_length_m / route["route_length_m"])
+
+
+def _shadow_penalty_fn(shadow_union: object | None, weight_field: str, shade_weight: float) -> ShadowPenaltyFn | None:
+    if shadow_union is None:
+        return None
+
+    def penalty(edge_geom: object, attrs: dict[str, object]) -> float:
+        if edge_geom is None or getattr(edge_geom, "is_empty", True):
+            return 0.0
+
+        base_cost = float(attrs.get(weight_field, attrs.get("length", 0.0)))
+        if base_cost <= 0:
+            return 0.0
+
+        shadow_length_m = edge_geom.intersection(shadow_union).length
+        shade_fraction = min(1.0, max(0.0, shadow_length_m / edge_geom.length)) if edge_geom.length else 0.0
+        return base_cost * shade_weight * (1.0 - shade_fraction)
+
+    return penalty
+
+
+def _load_local_buildings_for_route(
+    buildings_path: str | Path,
+    corridor: LineString,
+    route_crs: str,
+    shadow_time: pd.Timestamp,
+    read_buffer_m: float = 600.0,
+    source_crs: str = "EPSG:4326",
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    search_area = corridor.buffer(read_buffer_m)
+    search_area_wgs84 = gpd.GeoSeries([search_area], crs=route_crs).to_crs(source_crs).iloc[0]
+    minx, miny, maxx, maxy = search_area_wgs84.bounds
+
+    buildings = gpd.read_file(buildings_path, bbox=(minx, miny, maxx, maxy))
+    if buildings.empty:
+        return buildings, buildings
+
+    if buildings.crs is None:
+        buildings = buildings.set_crs(source_crs)
+    else:
+        buildings = buildings.to_crs(source_crs)
+
+    if "height" not in buildings.columns:
+        height_columns = [column for column in ("MAX_HEIGHT", "AVG_HEIGHT", "MIN_HEIGHT") if column in buildings.columns]
+        if height_columns:
+            buildings["height"] = buildings[height_columns].max(axis=1)
+        else:
+            buildings["height"] = 0
+
+    buildings = buildings[buildings["height"].fillna(0) > 0].copy()
+    if buildings.empty:
+        return buildings, buildings
+
+    buildings = pybdshadow.bd_preprocess(buildings, height="height")
+    shadows = pybdshadow.bdshadow_sunlight(buildings, shadow_time, roof=False, include_building=False)
+    buildings = buildings.to_crs(route_crs)
+    shadows = shadows.to_crs(route_crs)
+    shadows["geometry"] = shadows.geometry.apply(_clean_geometry)
+    return buildings, shadows
+
+
+def compute_shadow_aware_route_report(
+    graph: nx.Graph,
+    nodes_gdf: gpd.GeoDataFrame,
+    edges_gdf: gpd.GeoDataFrame,
+    start_coord: tuple[float, float] | list[float] | Point,
+    end_coord: tuple[float, float] | list[float] | Point,
+    shadow_time: pd.Timestamp,
+    buildings_path: str | Path = DEFAULT_BUILDINGS_PATH,
+    input_crs: str = "EPSG:4326",
+    route_buffer_m: float = 250.0,
+    shadow_read_buffer_m: float = 600.0,
+    shade_weight: float = 0.75,
+    routing_index: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    network_crs = str(edges_gdf.crs)
+    start_point = _coerce_point(start_coord, input_crs=input_crs, output_crs=network_crs)
+    end_point = _coerce_point(end_coord, input_crs=input_crs, output_crs=network_crs)
+    corridor = _projected_route_corridor(start_point, end_point, route_buffer_m)
+
+    buildings_gdf, shadows_gdf = _load_local_buildings_for_route(
+        buildings_path=buildings_path,
+        corridor=corridor,
+        route_crs=network_crs,
+        shadow_time=shadow_time,
+        read_buffer_m=shadow_read_buffer_m,
+    )
+
+    shadow_union = None if shadows_gdf.empty else gpd.GeoSeries(shadows_gdf.geometry.apply(_clean_geometry), crs=shadows_gdf.crs).union_all()
+    penalty_fn = _shadow_penalty_fn(shadow_union, weight_field="length", shade_weight=shade_weight)
+
+    fastest_route = compute_shortest_route(
+        graph=graph,
+        nodes_gdf=nodes_gdf,
+        edges_gdf=edges_gdf,
+        start_coord=start_coord,
+        end_coord=end_coord,
+        input_crs=input_crs,
+        weight_field="length",
+        routing_index=routing_index,
+        route_buffer_m=route_buffer_m,
+    )
+
+    shaded_route = compute_shortest_route(
+        graph=graph,
+        nodes_gdf=nodes_gdf,
+        edges_gdf=edges_gdf,
+        start_coord=start_coord,
+        end_coord=end_coord,
+        input_crs=input_crs,
+        weight_field="length",
+        routing_index=routing_index,
+        route_buffer_m=route_buffer_m,
+        shadow_penalty_fn=penalty_fn,
+    )
+
+    return {
+        "shadow_time": shadow_time,
+        "buildings_gdf": buildings_gdf,
+        "shadows_gdf": shadows_gdf,
+        "shadow_union": shadow_union,
+        "fastest_route": fastest_route,
+        "shaded_route": shaded_route,
+        "fastest_shade_pct": _route_shadow_fraction(fastest_route, shadow_union),
+        "shaded_shade_pct": _route_shadow_fraction(shaded_route, shadow_union),
+    }
+
+
+def plot_shadow_route_report(report: dict[str, object], ax: plt.Axes | None = None) -> tuple[plt.Figure, plt.Axes]:
+    buildings_gdf = report["buildings_gdf"]
+    shadows_gdf = report["shadows_gdf"]
+    fastest_route = report["fastest_route"]
+    shaded_route = report["shaded_route"]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 12))
+    else:
+        fig = ax.figure
+
+    if isinstance(buildings_gdf, gpd.GeoDataFrame) and not buildings_gdf.empty:
+        buildings_gdf.plot(ax=ax, color="#c7c7c7", edgecolor="none", alpha=0.35, zorder=1)
+    if isinstance(shadows_gdf, gpd.GeoDataFrame) and not shadows_gdf.empty:
+        shadows_gdf.plot(ax=ax, color="#1d4ed8", edgecolor="none", alpha=0.22, zorder=2)
+
+    def _route_segments(route: dict[str, object]) -> list[np.ndarray]:
+        return [np.asarray(edge["geometry"].coords) for edge in route["route_edges"] if edge.get("geometry") is not None and hasattr(edge["geometry"], "coords")]
+
+    ax.add_collection(LineCollection(_route_segments(fastest_route), linewidths=2.0, colors="#111827", alpha=0.8, zorder=4))
+    ax.add_collection(LineCollection(_route_segments(shaded_route), linewidths=3.0, colors="#dc2626", alpha=0.95, zorder=5))
+
+    ax.scatter([fastest_route["start_point"].x], [fastest_route["start_point"].y], s=55, zorder=6, label="start")
+    ax.scatter([fastest_route["end_point"].x], [fastest_route["end_point"].y], s=55, zorder=6, label="end")
+
+    ax.autoscale()
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_axis_off()
+    ax.legend(loc="upper right")
+    ax.set_title(
+        f"Fastest: {fastest_route['route_length_m']:.1f} m | Shade-aware: {shaded_route['route_length_m']:.1f} m"
+    )
+    return fig, ax
 
 
 def plot_route_between_coordinates(
