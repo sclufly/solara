@@ -58,6 +58,9 @@ def compute_shadow_aware_route_report(
         read_buffer_m=shadow_read_buffer_m,
     )
 
+    display_corridor = LineString([start_point, end_point]).buffer(800.0)
+    local_edges = edges_gdf[edges_gdf.geometry.intersects(display_corridor)]
+
     shadow_union = build_shadow_union(shadows_gdf)
 
     fastest_route = compute_shortest_route(
@@ -108,6 +111,7 @@ def compute_shadow_aware_route_report(
         "shaded_route":      shaded_route,
         "fastest_shade_pct": route_shadow_fraction(fastest_route, shadow_union),
         "shaded_shade_pct":  route_shadow_fraction(shaded_route,  shadow_union),
+        "edges_gdf":         local_edges,
     }
 
 

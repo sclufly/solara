@@ -20,18 +20,21 @@ def plot_shadow_route_report(
     """Plot buildings, shadows, and both routes from a shadow route report."""
     buildings_gdf = report["buildings_gdf"]
     shadows_gdf   = report["shadows_gdf"]
+    edges_gdf     = report["edges_gdf"]
     fastest_route = report["fastest_route"]
     shaded_route  = report["shaded_route"]
 
     fig, ax = _get_or_create_axes(ax)
 
-    if isinstance(buildings_gdf, gpd.GeoDataFrame) and not buildings_gdf.empty:
-        buildings_gdf.plot(ax=ax, color="#c7c7c7", edgecolor="none", alpha=0.35, zorder=1)
     if isinstance(shadows_gdf, gpd.GeoDataFrame) and not shadows_gdf.empty:
-        shadows_gdf.plot(ax=ax, color="#1d4ed8", edgecolor="none", alpha=0.22, zorder=2)
+        shadows_gdf.plot(ax=ax, color="#0e326b", edgecolor="none", alpha=0.35, zorder=1)
+    if isinstance(edges_gdf, gpd.GeoDataFrame) and not edges_gdf.empty:
+        edges_gdf.plot(ax=ax, linewidths=1.0, color="#9c9c9c", edgecolor="none", alpha=0.6, zorder=2)
+    if isinstance(buildings_gdf, gpd.GeoDataFrame) and not buildings_gdf.empty:
+        buildings_gdf.plot(ax=ax, color="#c7c7c7", edgecolor="none", alpha=0.9, zorder=3)
 
-    ax.add_collection(LineCollection(_route_segments(fastest_route), linewidths=2.0, colors="#111827", alpha=0.8,  zorder=4))
-    ax.add_collection(LineCollection(_route_segments(shaded_route),  linewidths=3.0, colors="#dc2626", alpha=0.95, zorder=5))
+    ax.add_collection(LineCollection(_route_segments(fastest_route), linewidths=2.0, colors="#f97316", alpha=0.8,  zorder=4))
+    ax.add_collection(LineCollection(_route_segments(shaded_route),  linewidths=3.0, colors="#0891b2", alpha=0.95, zorder=5))
 
     _plot_endpoints(ax, fastest_route)
 
@@ -113,8 +116,8 @@ def _coords(geometries) -> list[np.ndarray]:
 
 
 def _plot_endpoints(ax: plt.Axes, route: dict) -> None:
-    ax.scatter([route["start_point"].x], [route["start_point"].y], s=55, zorder=6, label="start")
-    ax.scatter([route["end_point"].x],   [route["end_point"].y],   s=55, zorder=6, label="end")
+    ax.scatter([route["start_point"].x], [route["start_point"].y], s=55, zorder=6, label="start", color="#44ce1b")
+    ax.scatter([route["end_point"].x],   [route["end_point"].y],   s=55, zorder=6, label="end", color="#e51f1f")
 
 
 def _local_edges(

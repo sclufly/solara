@@ -15,7 +15,8 @@ def main() -> None:
     t0 = time.perf_counter()
 
     engine = TorontoRoutingEngine.load(network_name=DEFAULT_NETWORK_NAME)
-    shadow_time = pd.Timestamp.now(tz="America/Toronto")
+    shadow_time = pd.to_datetime('2026-06-30 14:30:33.959797119').tz_localize('America/Toronto')
+    # shadow_time = pd.Timestamp.now(tz="America/Toronto")
 
     print(f"nodes table rows={len(engine.nodes_gdf)}")
     print(f"edges table rows={len(engine.edges_gdf)}")
@@ -31,7 +32,7 @@ def main() -> None:
     # eaton center
     end_coord = (-79.379964, 43.652288)
     # cbc building 
-    #end_coord = (-79.388826, 43.644417)
+    # end_coord = (-79.388826, 43.644417)
 
     report = compute_shadow_aware_route_report(
         graph=engine.graph,
