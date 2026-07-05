@@ -131,13 +131,34 @@ def rasterize_shadow_union(
     return grid, transform
 
 
+def rasterize_buildings(
+    buildings_gdf: gpd.GeoDataFrame,
+    transform,
+    out_shape: tuple[int, int],
+) -> np.ndarray:
+    """Burn building footprints into a boolean raster matching the shadow grid."""
+    if buildings_gdf.empty:
+        return np.zeros(out_shape, dtype=np.uint8)
+    return rio_rasterize(
+        [(mapping(geom), 1) for geom in buildings_gdf.geometry if geom is not None],
+        out_shape=out_shape,
+        transform=transform,
+        fill=0,
+        dtype=np.uint8,
+    )
+
+
 def shadow_fraction_from_raster(
     edge_geom,
     grid: np.ndarray,
     transform,
+    building_grid: np.ndarray | None = None,
     n_samples: int = 20,
 ) -> float:
-    """Sample an edge geometry against the shadow raster; return shaded fraction [0, 1]."""
+    """
+    Sample an edge against the shadow raster; return shaded fraction [0, 1].
+    Samples that fall inside a building footprint are counted as fully shaded.
+    """
     if edge_geom is None or edge_geom.is_empty:
         return 0.0
 
@@ -153,7 +174,16 @@ def shadow_fraction_from_raster(
 
     h, w  = grid.shape
     valid = (cols >= 0) & (cols < w) & (rows >= 0) & (rows < h)
-    return float(grid[rows[valid], cols[valid]].mean()) if valid.any() else 0.0
+    if not valid.any():
+        return 0.0
+
+    shadow_hits   = grid[rows[valid], cols[valid]].astype(float)
+    if building_grid is not None:
+        building_hits = building_grid[rows[valid], cols[valid]].astype(float)
+        # Treat inside-building samples as shaded
+        shadow_hits = np.clip(shadow_hits + building_hits, 0, 1)
+
+    return float(shadow_hits.mean())
 
 
 # ---------------------------------------------------------------------------
@@ -167,11 +197,11 @@ def annotate_edges_with_shadow(
     transform,
     weight_field: str,
     shade_weight: float,
+    building_grid: np.ndarray | None = None,
 ) -> None:
-    """Pre-cache shaded_cost on every edge in-place so A* needs no geometry calls."""
     for u, v, key, attrs in route_graph.edges(keys=True, data=True):
         geom = edge_lookup.get((u, v, key)) or edge_lookup.get((v, u, key))
-        frac = shadow_fraction_from_raster(geom, grid, transform) if geom else 0.0
+        frac = shadow_fraction_from_raster(geom, grid, transform, building_grid) if geom else 0.0
         base = float(attrs.get(weight_field, attrs.get("length", 0.0)))
         attrs["shaded_cost"] = base * (1.0 + shade_weight * (1.0 - frac))
 
@@ -180,14 +210,29 @@ def annotate_edges_with_shadow(
 # Route shadow reporting
 # ---------------------------------------------------------------------------
 
-def route_shadow_fraction(route: dict[str, object], shadow_union: object | None) -> float:
-    """Return the percentage of a route's physical length that falls in shadow."""
-    if shadow_union is None or route.get("route_length_m", 0.0) <= 0:
+def route_shadow_fraction(
+    route: dict[str, object],
+    shadow_union: object | None,
+    buildings_gdf: gpd.GeoDataFrame | None = None,
+) -> float:
+    """Percentage of route length in shadow or inside a building footprint."""
+    if route.get("route_length_m", 0.0) <= 0:
         return 0.0
 
-    shadow_length_m = sum(
-        edge["geometry"].intersection(shadow_union).length
-        for edge in route["route_edges"]
-        if edge.get("geometry") is not None and not edge["geometry"].is_empty
-    )
+    building_union = buildings_gdf.geometry.union_all() if buildings_gdf is not None and not buildings_gdf.empty else None
+
+    shadow_length_m = 0.0
+    for edge in route["route_edges"]:
+        geom = edge.get("geometry")
+        if geom is None or geom.is_empty:
+            continue
+        covered = geom
+        if shadow_union is not None:
+            covered = covered.intersection(shadow_union)
+        if building_union is not None:
+            # Union the building-interior portion with the shadow portion
+            interior = geom.intersection(building_union)
+            covered  = covered.union(interior)
+        shadow_length_m += covered.length
+
     return float(100.0 * shadow_length_m / route["route_length_m"])

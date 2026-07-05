@@ -20,6 +20,7 @@ from .shadows import (
     build_shadow_union,
     load_buildings_and_shadows,
     rasterize_shadow_union,
+    rasterize_buildings,
     route_shadow_fraction,
 )
 
@@ -77,6 +78,7 @@ def compute_shadow_aware_route_report(
 
     if shadow_union is not None:
         grid, transform = rasterize_shadow_union(shadow_union)
+        building_grid   = rasterize_buildings(buildings_gdf, transform, grid.shape)
 
         route_graph, edge_lookup = build_narrow_corridor_subgraph(
             graph=graph,
@@ -85,7 +87,7 @@ def compute_shadow_aware_route_report(
             fastest_route=fastest_route,
             narrow_buffer_m=narrow_buffer_m,
         )
-        annotate_edges_with_shadow(route_graph, edge_lookup, grid, transform, "length", shade_weight)
+        annotate_edges_with_shadow(route_graph, edge_lookup, grid, transform, "length", shade_weight, building_grid=building_grid)
 
         shaded_route = compute_shortest_route(
             graph=route_graph,
@@ -109,8 +111,8 @@ def compute_shadow_aware_route_report(
         "shadow_union":      shadow_union,
         "fastest_route":     fastest_route,
         "shaded_route":      shaded_route,
-        "fastest_shade_pct": route_shadow_fraction(fastest_route, shadow_union),
-        "shaded_shade_pct":  route_shadow_fraction(shaded_route,  shadow_union),
+        "fastest_shade_pct": route_shadow_fraction(fastest_route, shadow_union, buildings_gdf),
+        "shaded_shade_pct":  route_shadow_fraction(shaded_route,  shadow_union, buildings_gdf),
         "edges_gdf":         local_edges,
     }
 
