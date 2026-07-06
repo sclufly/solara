@@ -15,8 +15,8 @@ def main() -> None:
     t0 = time.perf_counter()
 
     engine = TorontoRoutingEngine.load(network_name=DEFAULT_NETWORK_NAME)
-    shadow_time = pd.to_datetime('2026-06-30 14:30:33.959797119').tz_localize('America/Toronto')
-    # shadow_time = pd.Timestamp.now(tz="America/Toronto")
+    # shadow_time = pd.to_datetime('2026-06-30 14:30:33.959797119').tz_localize('America/Toronto')
+    shadow_time = pd.Timestamp.now(tz="America/Toronto")
 
     print(f"nodes table rows={len(engine.nodes_gdf)}")
     print(f"edges table rows={len(engine.edges_gdf)}")
@@ -27,10 +27,15 @@ def main() -> None:
     t1 = time.perf_counter()
     print("=> load graph bundle:", t1 - t0)
 
+    # distillery district
+    start_coord = (-79.359469, 43.649939)
     # cn tower
-    start_coord = (-79.385882, 43.642017)
+    end_coord = (-79.385882, 43.642017)
+
+    # cn tower
+    # start_coord = (-79.385882, 43.642017)
     # eaton center
-    end_coord = (-79.379964, 43.652288)
+    # end_coord = (-79.379964, 43.652288)
     # cbc building 
     # end_coord = (-79.388826, 43.644417)
 
