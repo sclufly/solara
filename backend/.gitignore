@@ -1,0 +1,5 @@
+__pycache__/
+routing/__pycache__/
+cache
+data/*
+!data/*.py

@@ -1,10 +1,12 @@
+from pathlib import Path
+
 import pandas as pd
 import geopandas as gpd
 import pybdshadow
 import matplotlib.pyplot as plt
 import numpy as np
 
-DATA_PATH = r"./data/buildings/buildings.gpkg"
+DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "buildings" / "buildings.gpkg"
 
 # select a cluster of buildings within a local area of interest (AOI)
 def select_cluster_from_aoi(data_path, cluster_size=500, initial_radius_m=1200, max_radius_m=20000):

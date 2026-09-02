@@ -17,9 +17,10 @@ from rasterio.transform import from_bounds
 from rasterio.features import rasterize as rio_rasterize
 
 
+BACKEND_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_NETWORK_NAME = "toronto"
-DEFAULT_WALKING_PATHS_DIR = Path("data/walking-paths")
-DEFAULT_BUILDINGS_PATH = Path("data/buildings/buildings.gpkg")
+DEFAULT_WALKING_PATHS_DIR = BACKEND_DIR / "data" / "walking-paths"
+DEFAULT_BUILDINGS_PATH = BACKEND_DIR / "data" / "buildings" / "buildings.gpkg"
 ShadowPenaltyFn = Callable[[object, dict[str, object]], float]
 
 
