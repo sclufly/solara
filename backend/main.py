@@ -1,14 +1,25 @@
 from fastapi import FastAPI
+from pydantic import BaseModel
 
 import time
 
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from api.geocode import getLocation
+from api.routing import getRoute
+
 app = FastAPI()
 
-class GeocodeRequest:
+class GeocodeRequest(BaseModel):
     address: str
+
+class coordinate():
+    lat: float
+    long: float
+class ComputeRouteRequest(BaseModel):
+    start_coord: coordinate
+    end_coord: coordinate
 
 @app.get("/")
 def read_root():
@@ -16,9 +27,12 @@ def read_root():
 
 @app.post("/geocode")
 def geocode(geocode_request: GeocodeRequest):
-    
+    return getLocation(geocode_request.address)
 
-    
+@app.post("/compute_route")
+def compute_route(compute_route_request: ComputeRouteRequest):
+    return getRoute(compute_route_request.start_coord, compute_route_request.end_coord)
+
 
 from routing import (
     DEFAULT_BUILDINGS_PATH,
