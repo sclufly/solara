@@ -1,7 +1,24 @@
+from fastapi import FastAPI
+
 import time
 
 import pandas as pd
 import matplotlib.pyplot as plt
+
+app = FastAPI()
+
+class GeocodeRequest:
+    address: str
+
+@app.get("/")
+def read_root():
+    return {"Hello": "World"}
+
+@app.post("/geocode")
+def geocode(geocode_request: GeocodeRequest):
+    
+
+    
 
 from routing import (
     DEFAULT_BUILDINGS_PATH,

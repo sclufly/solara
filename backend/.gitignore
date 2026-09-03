@@ -3,3 +3,4 @@ routing/__pycache__/
 cache
 data/*
 !data/*.py
+.python-version
